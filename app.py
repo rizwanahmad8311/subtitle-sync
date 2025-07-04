@@ -8,6 +8,8 @@ from aeneas.task import Task
 import traceback
 import re
 import webvtt
+import threading
+import uvicorn
 
 
 
@@ -421,31 +423,92 @@ def create_interface():
     
     return interface
 
+def run_fastapi():
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
+
 def main():
-    """Launch the Gradio interface"""
     try:
-        # Test if Aeneas is available
-        from aeneas.executetask import ExecuteTask
-        from aeneas.task import Task
-        
+        threading.Thread(target=run_fastapi, daemon=True).start()
+
         interface = create_interface()
-        
-        print("🚀 Starting Aeneas Gradio Interface...")
-        print("📝 Make sure you have audio files and corresponding text ready!")
-        
+        print("🚀 Starting Gradio UI on http://localhost:7860")
+        print("🧠 FastAPI JSON endpoint available at http://localhost:8000/align")
+
         interface.launch(
             server_name="0.0.0.0",
             server_port=7860,
             share=False,
             debug=False
         )
-        
+
     except ImportError as e:
-        print("❌ Aeneas not found. Please install it first:")
-        print("   pip install aeneas")
-        print(f"\nError details: {e}")
+        print("❌ Missing dependency:", e)
     except Exception as e:
-        print(f"❌ Error starting interface: {e}")
+        print("❌ Error launching application:", e)
+
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import shutil
+
+fastapi_app = FastAPI()
+
+fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@fastapi_app.post("/align")
+async def align_api(
+    audio_file: UploadFile = File(...),
+    text_file: UploadFile = File(...),
+    language: str = Form(default="en")
+):
+    try:
+        if not text_file.filename.endswith(".txt"):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Text file must be a .txt file"}
+            )
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio_file.filename)[-1]) as temp_audio:
+            shutil.copyfileobj(audio_file.file, temp_audio)
+            audio_path = temp_audio.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode='w+', encoding='utf-8') as temp_text:
+            content = (await text_file.read()).decode('utf-8', errors='ignore')
+            temp_text.write(content)
+            temp_text.flush()
+            text_path = temp_text.name
+
+        status, df, json_path, summary, srt_path, vtt_path = process_alignment(audio_path, text_path, language)
+
+        if "Error" in status or status.startswith("❌"):
+            return JSONResponse(status_code=500, content={"error": status})
+
+        response = {
+            "status": status,
+            "summary": summary,
+            "segments": df.to_dict(orient="records") if df is not None else [],
+            "download_links": {
+                "alignment_json": json_path,
+                "srt": srt_path,
+                "vtt": vtt_path
+            }
+        }
+
+        return JSONResponse(status_code=200, content=response)
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Unexpected server error: {str(e)}"}
+        )
+
 
 if __name__ == "__main__":
     main()

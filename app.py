@@ -10,6 +10,9 @@ import re
 import webvtt
 import threading
 import uvicorn
+import subprocess
+import shutil
+from pathlib import Path
 
 
 
@@ -99,7 +102,6 @@ def convert_to_srt(fragments):
         if end <= start or not text:
             continue
 
-
         lines = wrap_text(text)
 
         srt_output.append(f"{index}")
@@ -111,18 +113,64 @@ def convert_to_srt(fragments):
     return "\n".join(srt_output)
 
 
+def check_ffmpeg():
+    """Check if FFmpeg is available on the system"""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
 
-def get_audio_file_path(audio_input):
-    if audio_input is None:
+
+def is_video_file(file_path):
+    """Check if the file is a video file based on extension"""
+    video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg'}
+    return Path(file_path).suffix.lower() in video_extensions
+
+
+def is_audio_file(file_path):
+    """Check if the file is an audio file based on extension"""
+    audio_extensions = {'.wav', '.mp3', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus'}
+    return Path(file_path).suffix.lower() in audio_extensions
+
+
+def convert_video_to_audio(video_path, output_path):
+    """Convert video file to audio using FFmpeg"""
+    try:
+        # Use FFmpeg to extract audio from video
+        cmd = [
+            'ffmpeg', '-i', video_path,
+            '-vn',  # No video
+            '-acodec', 'libmp3lame',  # MP3 codec
+            '-ab', '192k',  # Audio bitrate
+            '-ar', '44100',  # Sample rate
+            '-y',  # Overwrite output file
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg conversion failed: {result.stderr}")
+        
+        return True
+    except Exception as e:
+        raise RuntimeError(f"Error converting video to audio: {str(e)}")
+
+
+def get_media_file_path(media_input):
+    """Get file path from media input (audio or video)"""
+    if media_input is None:
         return None
     
-    if isinstance(audio_input, str):
-        return audio_input
-    elif isinstance(audio_input, tuple) and len(audio_input) >= 2:
-        return audio_input[1] if isinstance(audio_input[1], str) else audio_input[0]
+    if isinstance(media_input, str):
+        return media_input
+    elif isinstance(media_input, tuple) and len(media_input) >= 2:
+        return media_input[1] if isinstance(media_input[1], str) else media_input[0]
     else:
-        print(f"Debug: Unexpected audio input type: {type(audio_input)}")
-        return str(audio_input)
+        print(f"Debug: Unexpected media input type: {type(media_input)}")
+        return str(media_input)
+
 
 def get_text_file_path(text_input):
     if text_input is None:
@@ -136,16 +184,22 @@ def get_text_file_path(text_input):
         print(f"Debug: Unexpected text input type: {type(text_input)}")
         return str(text_input)
 
-def process_alignment(audio_file, text_file, language, progress=gr.Progress()):
+
+def process_alignment(media_file, text_file, language, progress=gr.Progress()):
     
-    if audio_file is None:
-        return "❌ Please upload an audio file", None, None, ""
+    if media_file is None:
+        return "❌ Please upload an audio or video file", None, None, "", None, None
     
     if text_file is None:
-        return "❌ Please upload a text file", None, None, ""
+        return "❌ Please upload a text file", None, None, "", None, None
+    
+    # Check if FFmpeg is available
+    if not check_ffmpeg():
+        return "❌ FFmpeg not found. Please install FFmpeg to process video files.", None, None, "", None, None
     
     # Initialize variables for cleanup
     temp_text_file_path = None
+    temp_audio_file_path = None
     output_file = None
     
     try:
@@ -153,6 +207,28 @@ def process_alignment(audio_file, text_file, language, progress=gr.Progress()):
         
         # Create temporary directory for better file handling
         temp_dir = tempfile.mkdtemp()
+        
+        # Get the media file path
+        media_file_path = get_media_file_path(media_file)
+        if not media_file_path:
+            raise ValueError("Could not determine media file path")
+        
+        # Verify media file exists
+        if not os.path.exists(media_file_path):
+            raise FileNotFoundError(f"Media file not found: {media_file_path}")
+        
+        # Process media file - convert video to audio if needed
+        if is_video_file(media_file_path):
+            progress(0.2, desc="Converting video to audio...")
+            temp_audio_file_path = os.path.join(temp_dir, "extracted_audio.mp3")
+            convert_video_to_audio(media_file_path, temp_audio_file_path)
+            audio_file_path = temp_audio_file_path
+            print(f"Debug: Video converted to audio: {audio_file_path}")
+        elif is_audio_file(media_file_path):
+            audio_file_path = media_file_path
+            print(f"Debug: Using audio file directly: {audio_file_path}")
+        else:
+            raise ValueError("Unsupported file format. Please provide an audio or video file.")
         
         # Get the text file path
         text_file_path = get_text_file_path(text_file)
@@ -177,12 +253,10 @@ def process_alignment(audio_file, text_file, language, progress=gr.Progress()):
         if not text_content:
             raise ValueError("Text file is empty or contains only whitespace")
         
+        progress(0.3, desc="Processing text file...")
+        
         temp_text_file_path = os.path.join(temp_dir, "input_text.txt")
         segment_text_file(text_content, temp_text_file_path)
-        # Create a copy of the text file in our temp directory for Aeneas
-
-        # with open(temp_text_file_path, 'w', encoding='utf-8') as f:
-        #     f.write(text_content)
         
         # Verify temp text file was created
         if not os.path.exists(temp_text_file_path):
@@ -191,16 +265,7 @@ def process_alignment(audio_file, text_file, language, progress=gr.Progress()):
         # Create output file path
         output_file = os.path.join(temp_dir, "alignment_output.json")
         
-        progress(0.3, desc="Creating task configuration...")
-        
-        # Get the correct audio file path
-        audio_file_path = get_audio_file_path(audio_file)
-        if not audio_file_path:
-            raise ValueError("Could not determine audio file path")
-        
-        # Verify audio file exists
-        if not os.path.exists(audio_file_path):
-            raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
+        progress(0.4, desc="Creating task configuration...")
         
         # Create task configuration
         config_string = f"task_language={language}|is_text_type=plain|os_task_file_format=json"
@@ -231,11 +296,9 @@ def process_alignment(audio_file, text_file, language, progress=gr.Progress()):
         with open(output_file, 'r', encoding='utf-8') as f:
             results = json.load(f)
 
-
         # Read output and convert to SRT
         fragments = task.sync_map.fragments
         srt_content = convert_to_srt(fragments)
-
 
         srt_path = os.path.join(temp_dir, "output.srt")
         vtt_path = os.path.join(temp_dir, "output.vtt")
@@ -269,8 +332,11 @@ def process_alignment(audio_file, text_file, language, progress=gr.Progress()):
         total_duration = float(results['fragments'][-1]['end']) if results['fragments'] else 0
         avg_segment_length = total_duration / len(results['fragments']) if results['fragments'] else 0
         
+        file_type = "video" if is_video_file(media_file_path) else "audio"
+        
         summary = f"""
 📊 **Alignment Summary**
+- **Input type:** {file_type.title()} file
 - **Total segments:** {len(results['fragments'])}
 - **Total duration:** {total_duration:.3f} seconds
 - **Average segment length:** {avg_segment_length:.3f} seconds
@@ -296,28 +362,31 @@ def process_alignment(audio_file, text_file, language, progress=gr.Progress()):
         
         error_msg = f"❌ Error during alignment: {str(e)}\n\n"
         error_msg += "**Troubleshooting tips:**\n"
-        error_msg += "- Ensure audio file is in WAV format\n"
+        error_msg += "- Ensure media file is in supported format (audio: WAV, MP3, FLAC, etc. | video: MP4, AVI, MKV, etc.)\n"
         error_msg += "- Ensure text file contains the spoken content\n"
         error_msg += "- Check that text file is in UTF-8 or Latin-1 encoding\n"
-        error_msg += "- Verify both audio and text files are not corrupted\n"
-        error_msg += "- Try with a shorter audio/text pair first\n"
-        error_msg += "- Make sure Aeneas dependencies are properly installed\n"
+        error_msg += "- Verify both media and text files are not corrupted\n"
+        error_msg += "- Try with a shorter audio/video/text pair first\n"
+        error_msg += "- Make sure FFmpeg and Aeneas dependencies are properly installed\n"
+        error_msg += "- For video files, ensure they contain audio tracks\n"
         
         if temp_text_file_path:
             error_msg += f"- Text file was processed from: {text_file_path}\n"
         
         error_msg += f"\n**Technical details:**\n```\n{traceback.format_exc()}\n```"
         
-        return error_msg, None, None, "", None
+        return error_msg, None, None, "", None, None
     
     finally:
         # Clean up temporary files
         try:
             if temp_text_file_path and os.path.exists(temp_text_file_path):
                 os.unlink(temp_text_file_path)
-            print(f"Debug: Cleaned up temp text file: {temp_text_file_path}")
+            if temp_audio_file_path and os.path.exists(temp_audio_file_path):
+                os.unlink(temp_audio_file_path)
+            print(f"Debug: Cleaned up temporary files")
         except Exception as cleanup_error:
-            print(f"Debug: Error cleaning up temp text file: {cleanup_error}")
+            print(f"Debug: Error cleaning up temporary files: {cleanup_error}")
 
 
 def create_interface():
@@ -326,18 +395,25 @@ def create_interface():
         gr.Markdown("""
         # 🎯 Aeneas Forced Alignment Tool
         
-        Upload an audio file and provide the corresponding text to generate precise time alignments.
+        Upload an audio or video file and provide the corresponding text to generate precise time alignments.
         Perfect for creating subtitles, analyzing speech patterns, or preparing training data.
+        
+        **Supported formats:**
+        - **Audio:** WAV, MP3, FLAC, AAC, OGG, WMA, M4A, OPUS
+        - **Video:** MP4, AVI, MKV, MOV, WMV, FLV, WebM, M4V, 3GP, MPG, MPEG
         """)
         
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown("### 📁 Input Files")
                 
-                audio_input = gr.Audio(
-                    label="Audio File",
-                    type="filepath",
-                    format="wav"
+                media_input = gr.File(
+                    label="Audio or Video File",
+                    file_types=[
+                        ".wav", ".mp3", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".opus",  # Audio
+                        ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg"  # Video
+                    ],
+                    file_count="single"
                 )
                 
                 text_input = gr.File(
@@ -345,7 +421,6 @@ def create_interface():
                     file_types=[".txt"],
                     file_count="single"
                 )
-                
                 
                 gr.Markdown("### ⚙️ Configuration")
                 
@@ -355,7 +430,6 @@ def create_interface():
                     label="Language Code",
                     info="ISO language code (en=English, es=Spanish, etc.)"
                 )
-                
                 
                 process_btn = gr.Button("🚀 Process Alignment", variant="primary", size="lg")
             
@@ -387,13 +461,11 @@ def create_interface():
                     visible=False
                 )
         
-        
         # Event handlers
-        
         process_btn.click(
             fn=process_alignment,
             inputs=[
-                audio_input,
+                media_input,
                 text_input,
                 language_input,
             ],
@@ -418,13 +490,13 @@ def create_interface():
             inputs=vtt_file_output,
             outputs=vtt_file_output
         )
-        
-        
     
     return interface
 
+
 def run_fastapi():
     uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
+
 
 def main():
     try:
@@ -447,10 +519,9 @@ def main():
         print("❌ Error launching application:", e)
 
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import shutil
 
 fastapi_app = FastAPI()
 
@@ -464,20 +535,34 @@ fastapi_app.add_middleware(
 
 @fastapi_app.post("/align")
 async def align_api(
-    audio_file: UploadFile = File(...),
+    media_file: UploadFile = File(...),
     text_file: UploadFile = File(...),
     language: str = Form(default="en")
 ):
     try:
+        # Validate text file
         if not text_file.filename.endswith(".txt"):
-            return JSONResponse(
+            raise HTTPException(
                 status_code=400,
-                content={"error": "Text file must be a .txt file"}
+                detail="Text file must be a .txt file"
             )
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio_file.filename)[-1]) as temp_audio:
-            shutil.copyfileobj(audio_file.file, temp_audio)
-            audio_path = temp_audio.name
+        
+        # Check if media file is supported
+        media_filename = media_file.filename.lower()
+        audio_extensions = {'.wav', '.mp3', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus'}
+        video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg'}
+        
+        file_ext = Path(media_filename).suffix.lower()
+        if file_ext not in audio_extensions and file_ext not in video_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported media file format: {file_ext}. Supported formats: {', '.join(sorted(audio_extensions | video_extensions))}"
+            )
+        
+        # Save uploaded files temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_media:
+            shutil.copyfileobj(media_file.file, temp_media)
+            media_path = temp_media.name
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode='w+', encoding='utf-8') as temp_text:
             content = (await text_file.read()).decode('utf-8', errors='ignore')
@@ -485,10 +570,18 @@ async def align_api(
             temp_text.flush()
             text_path = temp_text.name
 
-        status, df, json_path, summary, srt_path, vtt_path = process_alignment(audio_path, text_path, language)
+        # Process alignment
+        status, df, json_path, summary, srt_path, vtt_path = process_alignment(media_path, text_path, language)
+
+        # Clean up uploaded files
+        try:
+            os.unlink(media_path)
+            os.unlink(text_path)
+        except Exception as cleanup_error:
+            print(f"Warning: Error cleaning up uploaded files: {cleanup_error}")
 
         if "Error" in status or status.startswith("❌"):
-            return JSONResponse(status_code=500, content={"error": status})
+            raise HTTPException(status_code=500, detail=status)
 
         response = {
             "status": status,
@@ -503,10 +596,12 @@ async def align_api(
 
         return JSONResponse(status_code=200, content=response)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        return JSONResponse(
+        raise HTTPException(
             status_code=500,
-            content={"error": f"Unexpected server error: {str(e)}"}
+            detail=f"Unexpected server error: {str(e)}"
         )
 
 

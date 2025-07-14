@@ -3,16 +3,19 @@ import tempfile
 import json
 import pandas as pd
 import gradio as gr
+from gradio.routes import mount_gradio_app
 from aeneas.executetask import ExecuteTask
 from aeneas.task import Task
 import traceback
 import re
 import webvtt
-import threading
 import uvicorn
 import subprocess
 import shutil
 from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 
 
@@ -494,35 +497,6 @@ def create_interface():
     return interface
 
 
-def run_fastapi():
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
-
-
-def main():
-    try:
-        threading.Thread(target=run_fastapi, daemon=True).start()
-
-        interface = create_interface()
-        print("🚀 Starting Gradio UI on http://localhost:7860")
-        print("🧠 FastAPI JSON endpoint available at http://localhost:8000/align")
-
-        interface.launch(
-            server_name="0.0.0.0",
-            server_port=7860,
-            share=False,
-            debug=False
-        )
-
-    except ImportError as e:
-        print("❌ Missing dependency:", e)
-    except Exception as e:
-        print("❌ Error launching application:", e)
-
-
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-
 fastapi_app = FastAPI()
 
 fastapi_app.add_middleware(
@@ -533,7 +507,7 @@ fastapi_app.add_middleware(
     allow_headers=["*"],
 )
 
-@fastapi_app.post("/align")
+@fastapi_app.post("/align/")
 async def align_api(
     media_file: UploadFile = File(...),
     text_file: UploadFile = File(...),
@@ -605,5 +579,9 @@ async def align_api(
         )
 
 
+interface = create_interface()
+
+app = mount_gradio_app(fastapi_app, interface, path="")
+
 if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host="0.0.0.0", port=7860)

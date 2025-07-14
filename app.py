@@ -68,7 +68,7 @@ def segment_text_file(input_content, output_path,):
                         current_line = current_line[:-(len(moved_word))].rstrip()
 
                     result.append(current_line.strip())
-                    current_line = moved_word + " "
+                    current_line = moved_word + " " + word + " "
                 else:
                     result.append(current_line.strip())
                     current_line = remaining_line + " " + word + " "
